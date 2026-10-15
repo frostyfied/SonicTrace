@@ -1,0 +1,300 @@
+"""Direction estimation combining multi-band filtering, ITD (GCC-PHAT), and ILD cues."""
+
+from __future__ import annotations
+
+import math
+from typing import Optional, Tuple
+
+import numpy as np
+
+from src.config.settings import SpatialConfig
+from src.direction_estimation.cross_correlation import compute_gcc_phat_itd
+from src.direction_estimation.mouse_tracker import is_left_mouse_down
+from src.direction_estimation.types import DirectionEstimate
+
+
+class DirectionEstimator:
+    """Estimates acoustic azimuth direction and confidence from stereo transient buffers."""
+
+    def __init__(
+        self,
+        config: Optional[SpatialConfig] = None,
+        sample_rate: int = 48000,
+    ) -> None:
+        self.config = config or SpatialConfig()
+        self.sample_rate = sample_rate
+
+    def estimate(
+        self,
+        left_samples: np.ndarray,
+        right_samples: np.ndarray,
+        peak_db: float = -60.0,
+        is_firing: Optional[bool] = None,
+    ) -> DirectionEstimate:
+        """Calculate spatial azimuth, ITD, ILD, confidence, and self-sound status.
+
+        Args:
+            left_samples: 1D array of left channel transient samples.
+            right_samples: 1D array of right channel transient samples.
+            peak_db: Overall peak dBFS level of the transient.
+
+        Returns:
+            DirectionEstimate with azimuth_deg in [-90.0°, +90.0°] (0.0° is Ahead/Front).
+        """
+        n_len = min(len(left_samples), len(right_samples))
+        if n_len < 16:
+            return DirectionEstimate(
+                azimuth_deg=0.0,
+                itd_ms=0.0,
+                ild_db=0.0,
+                confidence=0.0,
+                is_self_sound=False,
+                is_uncertain=True,
+                dominant_band="mid",
+                azimuth_360_deg=0.0,
+                is_rear=False,
+                front_back_ratio=1.0,
+            )
+
+        # 1. Multi-band decomposition, dominant band selection, and pinna spectral ratio
+        dominant_band, flt_left, flt_right, front_back_ratio = self._extract_dominant_band(
+            left_samples[:n_len], right_samples[:n_len]
+        )
+
+        # 2. Interaural Time Difference (ITD) via GCC-PHAT on dominant band
+        itd_ms, conf_itd = compute_gcc_phat_itd(
+            flt_left,
+            flt_right,
+            sample_rate=self.sample_rate,
+            max_itd_ms=self.config.max_itd_ms,
+        )
+
+        # 3. Interaural Level Difference (ILD) in dB
+        energy_l = float(np.mean(flt_left**2))
+        energy_r = float(np.mean(flt_right**2))
+        ild_db = 10.0 * math.log10((energy_r + 1e-9) / (energy_l + 1e-9))
+        ild_db = max(-25.0, min(25.0, ild_db))
+
+        # 4. Angle estimation using Rayleigh's Duplex Theory
+        # ITD angle: arcsin(tau / tau_max)
+        itd_norm = max(-1.0, min(1.0, itd_ms / self.config.max_itd_ms))
+        theta_itd_deg = math.asin(itd_norm) * (180.0 / math.pi)
+
+        # ILD angle: non-linear arcsin mapping (psychoacoustically accurate).
+        # Small ILD changes near center correspond to larger angular shifts,
+        # while large ILD changes near 90° map to smaller angular increments.
+        head_shadow_max_db = 15.0
+        ild_norm = max(-1.0, min(1.0, ild_db / head_shadow_max_db))
+        theta_ild_deg = math.asin(ild_norm) * (180.0 / math.pi)
+
+        # Cue prominence detection:
+        # In PC game stereo playback, games use amplitude panning where ITD is near zero.
+        # If ITD is negligible (< 5.0°) but ILD is significant (>= 1.5 dB), the direction is in ILD!
+        itd_active = abs(theta_itd_deg) >= 5.0 and conf_itd >= 0.25
+        ild_active = abs(ild_db) >= 1.5
+
+        if ild_active and not itd_active:
+            # Standard stereo amplitude panning without binaural delay
+            fused_azimuth = theta_ild_deg
+        elif itd_active and not ild_active:
+            # Pure phase/delay cue
+            fused_azimuth = theta_itd_deg
+        elif itd_active and ild_active:
+            # Both cues active (HRTF binaural): fuse with frequency band weighting
+            if dominant_band == "low":
+                w_itd, w_ild = 0.60, 0.40
+            elif dominant_band == "high":
+                w_itd, w_ild = 0.30, 0.70
+            else:
+                w_itd, w_ild = self.config.itd_weight, self.config.ild_weight
+            total_w = w_itd + w_ild
+            fused_azimuth = (w_itd * theta_itd_deg + w_ild * theta_ild_deg) / total_w
+        else:
+            # Both near zero -> Directly Ahead (0.0°)
+            fused_azimuth = 0.0
+
+        fused_azimuth = float(max(-90.0, min(90.0, fused_azimuth)))
+
+        # 5. Confidence scoring
+        if ild_active and not itd_active:
+            confidence = float(min(1.0, 0.5 + abs(ild_db) / 20.0))
+        elif itd_active and not ild_active:
+            confidence = float(conf_itd)
+        elif itd_active and ild_active:
+            angle_diff = abs(theta_itd_deg - theta_ild_deg)
+            agreement = max(0.0, 1.0 - (angle_diff / 120.0))
+            confidence = float(max(0.0, min(1.0, 0.6 * conf_itd + 0.4 * agreement)))
+        else:
+            confidence = float(conf_itd)
+
+        is_uncertain = confidence < self.config.min_confidence
+
+        # 6. Self-sound check (player's own weapon)
+        if not getattr(self.config, "enable_self_sound_gating", True):
+            is_self_sound = False
+        else:
+            sample_peak_amp = float(
+                max(np.max(np.abs(left_samples[:n_len])), np.max(np.abs(right_samples[:n_len])))
+            ) if n_len > 0 else 0.0
+            peak_l_amp = float(np.max(np.abs(left_samples[:n_len]))) if n_len > 0 else 0.0
+            peak_r_amp = float(np.max(np.abs(right_samples[:n_len]))) if n_len > 0 else 0.0
+
+            if sample_peak_amp > 1e-6:
+                eff_peak_l_db = peak_db + 20.0 * math.log10(peak_l_amp / sample_peak_amp)
+                eff_peak_r_db = peak_db + 20.0 * math.log10(peak_r_amp / sample_peak_amp)
+            else:
+                eff_peak_l_db = peak_db
+                eff_peak_r_db = peak_db
+
+            # Physical mouse trigger gating:
+            # Player weapon fire ONLY occurs when Left Mouse Button (LMB) is pressed.
+            # In testing labs (like PUBG Sound Lab) or during enemy firefights, the player
+            # is not pressing LMB, so enemy gunshots from 0°/180° are NEVER falsely marked as self!
+            require_mouse = getattr(self.config, "require_mouse_for_self", True)
+            if require_mouse:
+                mouse_firing = is_firing if is_firing is not None else is_left_mouse_down()
+            else:
+                mouse_firing = True if is_firing is None else is_firing
+
+            # Bilateral gating: 1st-person weapon fires loudly in BOTH ears simultaneously,
+            # with balanced energy (|ILD| <= 3.5 dB). Lateral sounds (|ILD| > 3.5 dB) are external!
+            is_bilateral_self = (
+                eff_peak_l_db >= self.config.bilateral_self_threshold_db
+                and eff_peak_r_db >= self.config.bilateral_self_threshold_db
+                and abs(ild_db) <= 3.5
+            )
+
+            is_self_sound = bool(mouse_firing and is_bilateral_self)
+
+        # Pin self-sounds to 0.0° (Center/Origin) to prevent weapon stereo offsets from swinging L/R
+        if is_self_sound:
+            fused_azimuth = 0.0
+
+        # 7. Front vs. Behind (HRTF Pinna Spectral Cues & 360° Polar Bearing)
+        is_rear = False
+        enable_fb = getattr(self.config, "enable_front_back", False)
+        spatial_mode = getattr(self.config, "spatial_mode", "stereo_180")
+
+        if not is_self_sound and enable_fb and spatial_mode == "hrtf_360":
+            # CRITICAL ESPORTS GUARD: Sounds directly in front or near center (|azimuth| <= 6.0°)
+            # must NEVER be flipped to rear! In stereo gaming, facing the enemy = 0° AHEAD.
+            # Only off-center sounds (> 6.0°) can be considered for rear pinna spectral shadowing.
+            if abs(fused_azimuth) > 6.0:
+                rear_thresh = getattr(self.config, "rear_ratio_threshold", 0.08)
+                is_rear = bool(front_back_ratio < rear_thresh)
+
+        # 360° Polar Mapping:
+        # Ahead: 0.0°, Right: +90.0°, Left: -90.0°, Behind: ±180.0°
+        if is_self_sound:
+            azimuth_360 = 0.0
+            is_rear = False
+        elif not is_rear:
+            azimuth_360 = fused_azimuth
+        else:
+            if fused_azimuth > 0.0:
+                azimuth_360 = 180.0 - fused_azimuth
+            elif fused_azimuth < 0.0:
+                azimuth_360 = -180.0 - fused_azimuth
+            else:
+                azimuth_360 = 180.0
+
+        return DirectionEstimate(
+            azimuth_deg=round(fused_azimuth, 1),
+            itd_ms=round(itd_ms, 3),
+            ild_db=round(ild_db, 1),
+            confidence=round(confidence, 2),
+            is_self_sound=is_self_sound,
+            is_uncertain=is_uncertain,
+            dominant_band=dominant_band,
+            azimuth_360_deg=round(azimuth_360, 1),
+            is_rear=is_rear,
+            front_back_ratio=round(front_back_ratio, 3),
+        )
+
+
+    @staticmethod
+    def _cosine_taper_mask(
+        freqs: np.ndarray, low_hz: float, high_hz: float, roll_off_hz: float = 200.0
+    ) -> np.ndarray:
+        """Create a smooth cosine-tapered bandpass mask to avoid Gibbs ringing.
+
+        Instead of brick-wall rectangular masks that produce severe ringing artifacts
+        in the reconstructed time-domain signal, this uses cosine tapers at band edges
+        for smooth roll-off.
+        """
+        mask = np.zeros(len(freqs), dtype=np.float64)
+
+        for i, f in enumerate(freqs):
+            if f < low_hz - roll_off_hz or f > high_hz + roll_off_hz:
+                mask[i] = 0.0
+            elif f < low_hz:
+                # Rising cosine taper
+                mask[i] = 0.5 * (1.0 + math.cos(math.pi * (low_hz - f) / roll_off_hz))
+            elif f > high_hz:
+                # Falling cosine taper
+                mask[i] = 0.5 * (1.0 + math.cos(math.pi * (f - high_hz) / roll_off_hz))
+            else:
+                mask[i] = 1.0
+
+        return mask
+
+    def _extract_dominant_band(
+        self, left: np.ndarray, right: np.ndarray
+    ) -> Tuple[str, np.ndarray, np.ndarray, float]:
+        """Decompose stereo samples into Low, Mid, and High frequency bands via FFT, and compute HRTF front-back ratio.
+
+        Applies a Hann window before FFT to prevent spectral leakage, and uses smooth
+        cosine-tapered band edges instead of brick-wall rectangular masks to avoid
+        Gibbs ringing artifacts in the reconstructed time-domain signals.
+        """
+        n = len(left)
+
+        # Apply Hann window to prevent spectral leakage before FFT.
+        # Without windowing, the implicit rectangular window creates side-lobes that
+        # smear energy across frequency bins and corrupt cross-correlation peaks.
+        window = np.hanning(n).astype(np.float32)
+        fft_l = np.fft.rfft(left * window)
+        fft_r = np.fft.rfft(right * window)
+
+        freqs = np.fft.rfftfreq(n, d=1.0 / self.sample_rate)
+
+        # Band energy computation using simple masks (for selection only)
+        mask_low = (freqs >= 80.0) & (freqs < 1200.0)
+        mask_mid = (freqs >= 1200.0) & (freqs < 4000.0)
+        mask_high = freqs >= 4000.0
+
+        energy_low = float(np.sum(np.abs(fft_l[mask_low]) ** 2 + np.abs(fft_r[mask_low]) ** 2))
+        energy_mid = float(np.sum(np.abs(fft_l[mask_mid]) ** 2 + np.abs(fft_r[mask_mid]) ** 2))
+        energy_high = float(np.sum(np.abs(fft_l[mask_high]) ** 2 + np.abs(fft_r[mask_high]) ** 2))
+
+        # HRTF Pinna spectral ratio:
+        # High shelf (>= 7500 Hz) vs Mid presence (1500 - 4500 Hz)
+        mask_mid_presence = (freqs >= 1500.0) & (freqs < 4500.0)
+        mask_high_shelf = freqs >= 7500.0
+        p_mid = float(np.sum(np.abs(fft_l[mask_mid_presence]) ** 2 + np.abs(fft_r[mask_mid_presence]) ** 2))
+        p_high = float(np.sum(np.abs(fft_l[mask_high_shelf]) ** 2 + np.abs(fft_r[mask_high_shelf]) ** 2))
+        front_back_ratio = float(p_high / (p_mid + 1e-9))
+
+        # Select dominant band
+        if energy_high >= energy_mid and energy_high >= energy_low:
+            chosen_band = "high"
+        elif energy_mid >= energy_low:
+            chosen_band = "mid"
+        else:
+            chosen_band = "low"
+
+        # Build smooth cosine-tapered bandpass mask for the chosen band
+        band_ranges = {
+            "low": (80.0, 1200.0),
+            "mid": (1200.0, 4000.0),
+            "high": (4000.0, self.sample_rate / 2.0),
+        }
+        low_hz, high_hz = band_ranges[chosen_band]
+        smooth_mask = self._cosine_taper_mask(freqs, low_hz, high_hz, roll_off_hz=200.0)
+
+        # Reconstruct filtered band in time domain with smooth roll-off
+        flt_l = np.fft.irfft(fft_l * smooth_mask, n=n).astype(np.float32)
+        flt_r = np.fft.irfft(fft_r * smooth_mask, n=n).astype(np.float32)
+
+        return chosen_band, flt_l, flt_r, front_back_ratio
+

@@ -1,0 +1,41 @@
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Audio captures & user data
+*.wav
+*.mp3
+*.ogg
+*.flac
+captures/
+recordings/
+
+# Local configuration overrides & logs
+config.local.json
+*.log
+
+# Build & packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
