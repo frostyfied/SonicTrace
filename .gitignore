@@ -39,3 +39,6 @@ dist/
 .idea/
 *.swp
 *.swo
+
+# Temp files
+tmp/

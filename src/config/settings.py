@@ -111,12 +111,12 @@ class SpatialConfig:
     self_footstep_max_angle_deg: float = 6.0
     self_footstep_min_db: float = -46.0
     self_footstep_max_db: float = -20.0
-    spatial_mode: str = "stereo_180"  # "stereo_180" (recommended for stereo gaming) or "hrtf_360" (polar surround)
-    enable_front_back: bool = False   # Disabled by default: prevents false rear flipping on gunfire
+    spatial_mode: str = "hrtf_360"  # "hrtf_360" (polar surround with world-space compass) or "stereo_180" (stereo forward dome)
+    enable_front_back: bool = False   # Disabled by default: prevents false rear flipping on non-HRTF stereo audio
     rear_ratio_threshold: float = 0.08
     cluster_angular_tolerance_deg: float = 20.0
-    cluster_lifetime_s: float = 8.0  # Persistent ray window in seconds
-    enable_mouse_compass: bool = False  # Direct Screen-Locked mode by default (zero mouse drift)
+    cluster_lifetime_s: float = 2.0  # Persistent ray window in seconds (2.0s default)
+    enable_mouse_compass: bool = True  # World-Space Gyro Compass active by default (compensates in-game mouse turns)
     mouse_yaw_sensitivity: float = 0.05  # Degrees per mouse hardware count
     on_target_tolerance_deg: float = 6.0  # Angular lock-on threshold around 0° Ahead
     require_mouse_for_self: bool = True  # Requires physical mouse click (LMB) to classify as player weapon self-sound
@@ -165,7 +165,7 @@ class AppConfig:
     overlay_x: Optional[int] = None
     overlay_y: Optional[int] = None
     overlay_diameter: int = 320
-    overlay_opacity: float = 0.85
+    overlay_opacity: float = 0.20
     overlay_locked: bool = True
     overlay_visible: bool = True
     overlay_type: str = "rays"  # "rays" (lines) or "zones" (curved threat arcs)
@@ -203,7 +203,7 @@ class AppConfig:
             overlay_x=data.get("overlay_x"),
             overlay_y=data.get("overlay_y"),
             overlay_diameter=data.get("overlay_diameter", 320),
-            overlay_opacity=data.get("overlay_opacity", 0.85),
+            overlay_opacity=data.get("overlay_opacity", 0.20),
             overlay_locked=data.get("overlay_locked", True),
             overlay_visible=data.get("overlay_visible", True),
             overlay_type=data.get("overlay_type", "rays"),

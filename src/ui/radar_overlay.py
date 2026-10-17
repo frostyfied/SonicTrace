@@ -22,7 +22,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QWidget
 
 from src.direction_estimation.mouse_tracker import MouseYawTracker
-from src.direction_estimation.threat_tracker import SpatialThreatTracker, ThreatCluster
+from src.direction_estimation.threat_tracker import SpatialThreatTracker, ThreatCluster, normalize_bearing_360
 from src.event_classification.types import SoundType
 from src.event_detection.types import SoundEvent
 
@@ -40,6 +40,7 @@ class RadarPing:
     lifetime_s: float = 1.8
     sound_type: SoundType = SoundType.SOUND
     is_rear: bool = False
+    world_azimuth_deg: float = 0.0
 
 
 class RadarOverlayWindow(QWidget):
@@ -63,32 +64,34 @@ class RadarOverlayWindow(QWidget):
 
         self._is_locked: bool = True
         self._show_self_sounds: bool = True
-        self._hud_opacity: float = 0.85
-        self._spatial_mode: str = "stereo_180"
+        self._hud_opacity: float = 0.20
+        self._spatial_mode: str = "hrtf_360"
         self._radar_type: str = "rays"  # "rays" (lines) or "zones" (curved sector arcs)
         self._show_sound_circles: bool = True  # If False, hides mini-circles for sounds
         self._show_sound_numbers: bool = True  # If False, hides numeric counters/metrics on radar
         self._pings: List[RadarPing] = []
         self._drag_pos: Optional[QPoint] = None
 
-        # Persistent multi-threat spatial clustering engine (8.0s default persistence)
+        # Persistent multi-threat spatial clustering engine (2.0s default persistence)
         self.threat_tracker = SpatialThreatTracker(
             angular_tolerance_deg=20.0,
-            cluster_lifetime_s=8.0,
+            cluster_lifetime_s=2.0,
             on_target_tolerance_deg=6.0,
         )
 
-        # Mouse gyro compass tracking engine (disabled by default for Direct Screen-Locked Mode)
-        self.mouse_tracker = MouseYawTracker(sensitivity_deg_per_count=0.05, enabled=False)
+        # Mouse gyro compass tracking engine (active by default for World-Space Head Tracking)
+        self.mouse_tracker = MouseYawTracker(sensitivity_deg_per_count=0.05, enabled=True)
         self.mouse_tracker.start()
 
         # Latest event tracking for active directional sweep beam
         self._latest_azimuth_deg: Optional[float] = None
+        self._latest_world_azimuth_deg: Optional[float] = None
         self._latest_event_time: float = 0.0
         self._latest_is_self: bool = False
         self._latest_peak_db: float = -60.0
         self._latest_sound_type: SoundType = SoundType.SOUND
         self._latest_is_rear: bool = False
+        self._last_yaw: float = 0.0
 
         # Lock mode setup
         self._apply_lock_state()
@@ -179,8 +182,13 @@ class RadarOverlayWindow(QWidget):
     def reset_gyro_heading(self) -> None:
         """Reset player gyro heading to 0.0° (Center Ahead) and re-synchronize active threats."""
         self.mouse_tracker.reset_yaw(0.0)
+        self._last_yaw = 0.0
         for cluster in self.threat_tracker._clusters:
             cluster.world_azimuth_deg = cluster.azimuth_deg
+        for ping in self._pings:
+            ping.world_azimuth_deg = ping.azimuth_deg
+        if self._latest_azimuth_deg is not None:
+            self._latest_world_azimuth_deg = self._latest_azimuth_deg
         self.update()
 
     def set_cluster_lifetime(self, lifetime_s: float) -> None:
@@ -229,6 +237,8 @@ class RadarOverlayWindow(QWidget):
             bearing = direction.azimuth_deg
             is_rear = False
 
+        world_az = normalize_bearing_360(bearing + current_yaw)
+
         ping = RadarPing(
             azimuth_deg=bearing,
             peak_db=event.peak_db,
@@ -239,11 +249,13 @@ class RadarOverlayWindow(QWidget):
             lifetime_s=1.8,
             sound_type=event.sound_type,
             is_rear=is_rear,
+            world_azimuth_deg=world_az,
         )
         self._pings.append(ping)
 
         # Update latest active beam direction
         self._latest_azimuth_deg = bearing
+        self._latest_world_azimuth_deg = world_az
         self._latest_event_time = time.monotonic()
         self._latest_is_self = is_self
         self._latest_peak_db = event.peak_db
@@ -265,8 +277,12 @@ class RadarOverlayWindow(QWidget):
             self._latest_azimuth_deg is not None
             and (now - self._latest_event_time) < 2.5
         )
+        yaw_changed = (self.mouse_tracker.enabled and abs(current_yaw - self._last_yaw) > 1e-3)
+        self._last_yaw = current_yaw
+
         if (
-            len(alive_pings) != len(self._pings)
+            yaw_changed
+            or len(alive_pings) != len(self._pings)
             or len(alive_pings) > 0
             or len(clusters) > 0
             or has_active_beam
@@ -314,6 +330,7 @@ class RadarOverlayWindow(QWidget):
         is_hrtf_360 = (self._spatial_mode == "hrtf_360")
         current_yaw = self.mouse_tracker.get_yaw_deg()
         clusters = self.threat_tracker.get_active_clusters(current_yaw=current_yaw, now=now)
+        is_on_target_now = any(c.is_on_target for c in clusters)
 
         # 1. Unlocked guide border
         if not self._is_locked:
@@ -384,12 +401,16 @@ class RadarOverlayWindow(QWidget):
         # 6. Direction Labels & Status Mode Pill
         painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
 
-        # 0° Ahead Top Indicator (Clean Tactical Crosshair Label)
+        # 0° Ahead Top Indicator (Clean Tactical Crosshair Label with On-Target Lock)
         ahead_p = QPointF(center.x(), center.y() - radius + 12.0)
-        painter.setPen(QColor(56, 189, 248, int(240 * self._hud_opacity)))
-        ahead_lbl = "▲ 0°" if self._show_sound_numbers else "▲"
+        if is_on_target_now:
+            painter.setPen(QColor(52, 211, 153, int(255 * self._hud_opacity)))  # Neon Emerald
+            ahead_lbl = "▲ 0° LOCK" if self._show_sound_numbers else "▲ LOCK"
+        else:
+            painter.setPen(QColor(56, 189, 248, int(240 * self._hud_opacity)))
+            ahead_lbl = "▲ 0°" if self._show_sound_numbers else "▲"
         painter.drawText(
-            QRectF(ahead_p.x() - 30, ahead_p.y() - 10, 60, 20),
+            QRectF(ahead_p.x() - 35, ahead_p.y() - 10, 70, 20),
             Qt.AlignmentFlag.AlignCenter,
             ahead_lbl,
         )
@@ -603,7 +624,11 @@ class RadarOverlayWindow(QWidget):
                 painter.drawEllipse(center, halo_radius, halo_radius)
             elif self._show_sound_circles:
                 # External transient ping: Expanding orange shockwave along bearing
-                rad = math.radians(ping.azimuth_deg - 90.0)
+                if self.mouse_tracker.enabled:
+                    ping_screen_az = normalize_bearing_360(ping.world_azimuth_deg - current_yaw)
+                else:
+                    ping_screen_az = ping.azimuth_deg
+                rad = math.radians(ping_screen_az - 90.0)
                 ping_dist = radius * (0.45 + 0.50 * progress)
                 ping_pos = QPointF(
                     center.x() + ping_dist * math.cos(rad),
@@ -616,12 +641,21 @@ class RadarOverlayWindow(QWidget):
                 painter.drawEllipse(ping_pos, ping_size, ping_size)
 
         # 9. Center Player Crosshair Reticle (Clean Tactical Design)
-        reticle_color = QColor(148, 163, 184, int(220 * self._hud_opacity))
-        painter.setPen(QPen(reticle_color, 1.8))
+        reticle_color = (
+            QColor(52, 211, 153, int(240 * self._hud_opacity))
+            if is_on_target_now
+            else QColor(148, 163, 184, int(220 * self._hud_opacity))
+        )
+        painter.setPen(QPen(reticle_color, 2.0 if is_on_target_now else 1.8))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawEllipse(center, 5.0, 5.0)
 
-        painter.setPen(QPen(QColor(56, 189, 248, int(240 * self._hud_opacity)), 2.0))
+        chevron_color = (
+            QColor(52, 211, 153, int(255 * self._hud_opacity))
+            if is_on_target_now
+            else QColor(56, 189, 248, int(240 * self._hud_opacity))
+        )
+        painter.setPen(QPen(chevron_color, 2.2 if is_on_target_now else 2.0))
         chevron = [
             QPointF(center.x(), center.y() - 9.0),
             QPointF(center.x() - 4.5, center.y() - 3.0),
@@ -676,7 +710,11 @@ class RadarOverlayWindow(QWidget):
             painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, badge_text)
         elif self._latest_azimuth_deg is not None and (now - self._latest_event_time) < 2.5:
             badge_col = QColor(249, 115, 22, int(240 * self._hud_opacity))
-            label = self._format_bearing_label(self._latest_azimuth_deg)
+            if self.mouse_tracker.enabled and self._latest_world_azimuth_deg is not None:
+                screen_az = normalize_bearing_360(self._latest_world_azimuth_deg - current_yaw)
+            else:
+                screen_az = self._latest_azimuth_deg
+            label = self._format_bearing_label(screen_az)
             if self._show_sound_numbers:
                 badge_text = f"{label} [{self._latest_peak_db:.0f} dB]"
             else:

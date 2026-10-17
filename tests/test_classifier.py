@@ -199,3 +199,29 @@ def test_continuous_distant_gunfire_burst_tracking() -> None:
 
     # All 3 shots in the rapid burst must register (anti-poisoning prevents LTA swallowing)
     assert detected_shots == 3
+
+
+def test_self_footstep_cadence_suppression() -> None:
+    """Centered low-level footsteps matching human locomotion cadence (200-680ms) are classified as SELF when enabled."""
+    fs = 48000
+    classifier = SoundClassifier(sample_rate=fs)
+    spatial_cfg = SpatialConfig(suppress_self_footsteps=True)
+
+    step = _generate_footstep_synthetic(sample_rate=fs, peak_amp=0.03)
+    centered_dir = DirectionEstimate(
+        azimuth_deg=0.0,
+        itd_ms=0.0,
+        ild_db=0.0,
+        confidence=0.85,
+        is_self_sound=False,
+        is_uncertain=False,
+        dominant_band="low",
+    )
+
+    # First isolated step is treated as external sound
+    st1, _ = classifier.classify(step, step, centered_dir, peak_db=-30.0, timestamp=1.00, spatial_config=spatial_cfg)
+    assert st1 == SoundType.SOUND
+
+    # Second step 380ms later matching cadence is classified as SELF
+    st2, _ = classifier.classify(step, step, centered_dir, peak_db=-30.0, timestamp=1.38, spatial_config=spatial_cfg)
+    assert st2 == SoundType.SELF

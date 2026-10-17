@@ -52,11 +52,7 @@ class TransientEventDetector:
         self._lta_frozen_until: float = -1.0
         self._event_counter: int = 0
 
-        # Rolling context buffer for wider direction estimation window.
-        # Direction estimation on a single 512-sample subframe (~10.7ms) provides very
-        # coarse FFT resolution and cross-correlation precision. By storing recent filtered
-        # samples and extracting a wider 2048-sample context centered on the trigger point,
-        # we get 4x better frequency resolution and much more reliable ITD/ILD estimates.
+        # Rolling context buffer for wider direction estimation window (2048 samples).
         self._context_target_samples: int = 2048
         self._prev_left: np.ndarray = np.zeros(0, dtype=np.float32)
         self._prev_right: np.ndarray = np.zeros(0, dtype=np.float32)
@@ -83,31 +79,39 @@ class TransientEventDetector:
         self.classifier.reset()
 
     def _apply_high_pass(self, channel: np.ndarray) -> np.ndarray:
-        """High-pass filter channel to eliminate low-frequency rumble below cutoff."""
+        """High-pass filter channel using smooth cosine roll-on to eliminate rumble without ringing."""
         cutoff = self.config.high_pass_hz
         if cutoff <= 0.0 or len(channel) < 32:
             return channel
         n = len(channel)
         fft_c = np.fft.rfft(channel)
         freqs = np.fft.rfftfreq(n, d=1.0 / self.sample_rate)
-        fft_c[freqs < cutoff] = 0.0
-        return np.fft.irfft(fft_c, n=n).astype(np.float32)
+        taper_w = min(40.0, cutoff * 0.5)
+        mask = np.ones_like(freqs, dtype=np.float32)
+        mask[freqs <= (cutoff - taper_w)] = 0.0
+        in_taper = (freqs > (cutoff - taper_w)) & (freqs < cutoff)
+        if np.any(in_taper):
+            mask[in_taper] = 0.5 * (
+                1.0 + np.cos(np.pi * (cutoff - freqs[in_taper]) / taper_w)
+            )
+        return np.fft.irfft(fft_c * mask, n=n).astype(np.float32)
 
     def _extract_context_window(
         self,
         extended_left: np.ndarray,
         extended_right: np.ndarray,
-        trigger_center_in_ext: int,
+        trigger_start_in_ext: int,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Extract a wider context window centered on the trigger point for direction estimation.
+        """Extract an onset-aligned context window around the trigger subframe.
 
-        Uses the extended buffer (previous chunk + current chunk) to extract up to
-        _context_target_samples samples centered on the trigger, providing much better
-        FFT frequency resolution and cross-correlation precision than a raw 512-sample subframe.
+        Allocates 256 samples (~5.3ms) of pre-onset margin and up to 1792 samples
+        (~37.3ms) of post-onset signal, avoiding excess pre-trigger background noise
+        when transients fire in the final subframe of a chunk.
         """
-        half_ctx = self._context_target_samples // 2
-        ctx_start = max(0, trigger_center_in_ext - half_ctx)
-        ctx_end = min(len(extended_left), trigger_center_in_ext + half_ctx)
+        pre_samples = min(256, self._context_target_samples // 4)
+        post_samples = self._context_target_samples - pre_samples
+        ctx_start = max(0, trigger_start_in_ext - pre_samples)
+        ctx_end = min(len(extended_left), trigger_start_in_ext + post_samples)
         return extended_left[ctx_start:ctx_end], extended_right[ctx_start:ctx_end]
 
     def process_chunk(
@@ -149,26 +153,24 @@ class TransientEventDetector:
             left_filtered = left_ch
             right_filtered = right_ch
 
-        # Build extended buffer: previous chunk + current chunk for wider context windows.
-        # When a trigger fires at the start of a chunk, the previous chunk's samples
-        # provide backward context for the direction estimation window.
+        # Build extended buffer: previous chunk + current chunk for wider context windows
         extended_left = np.concatenate([self._prev_left, left_filtered])
         extended_right = np.concatenate([self._prev_right, right_filtered])
         prev_len = len(self._prev_left)
 
         num_samples = len(left_ch)
-        subframe_dur = self.subframe_size / float(self.sample_rate)
-
-        # Alpha smoothing factors for EMA
-        alpha_sta = 1.0 - math.exp(-subframe_dur / self._tau_sta)
-        alpha_lta = 1.0 - math.exp(-subframe_dur / self._tau_lta)
 
         # Process the chunk in subframes for high temporal resolution
         for start_idx in range(0, num_samples, self.subframe_size):
             end_idx = min(num_samples, start_idx + self.subframe_size)
             sub_len = end_idx - start_idx
-            if sub_len == 0:
+            if sub_len < 32:
                 continue
+
+            # Exact subframe duration for variable-sized process loopback buffers
+            subframe_dur = sub_len / float(self.sample_rate)
+            alpha_sta = 1.0 - math.exp(-subframe_dur / self._tau_sta)
+            alpha_lta = 1.0 - math.exp(-subframe_dur / self._tau_lta)
 
             sub_time = now + (start_idx / float(self.sample_rate))
             sub_left = left_filtered[start_idx:end_idx]
@@ -178,8 +180,12 @@ class TransientEventDetector:
             right_energy = float(np.mean(sub_right**2))
             frame_energy = (left_energy + right_energy) * 0.5
 
-            peak_amp = float(max(np.max(np.abs(sub_left)), np.max(np.abs(sub_right))))
+            peak_l_amp = float(np.max(np.abs(sub_left)))
+            peak_r_amp = float(np.max(np.abs(sub_right)))
+            peak_amp = max(peak_l_amp, peak_r_amp)
             peak_db = 20.0 * math.log10(peak_amp) if peak_amp > 1e-6 else -60.0
+            left_peak_db = 20.0 * math.log10(peak_l_amp) if peak_l_amp > 1e-6 else -60.0
+            right_peak_db = 20.0 * math.log10(peak_r_amp) if peak_r_amp > 1e-6 else -60.0
 
             # Establish initial baseline on first non-silent or initial frame
             if not self._initialized:
@@ -188,16 +194,11 @@ class TransientEventDetector:
                 self._initialized = True
                 continue
 
-            # Compute trigger ratio using RAW frame energy against LTA baseline.
-            # Using frame_energy directly (instead of the EMA-smoothed STA) captures
-            # the full onset spike without dilution from the previous STA value.
-            # This is critical for detecting sharp transients that the EMA would smooth down.
+            # Compute trigger ratio using RAW frame energy against LTA baseline
             noise_floor = 1e-6
             ratio = frame_energy / (self._lta_energy + noise_floor)
 
-            # Save pre-update STA for the onset verification check below.
-            # This prevents the circular dependency where is_onset compared frame_energy
-            # against an STA that already included frame_energy.
+            # Save pre-update STA for the onset verification check
             pre_update_sta = self._sta_energy
 
             # Update STA (Short-Term Average) — done AFTER ratio computation
@@ -212,10 +213,7 @@ class TransientEventDetector:
                 or time_since_last_self < self_lockout_sec
             )
 
-            # Ensure the current subframe is actively in an onset attack, not in a decaying tail.
-            # Uses pre-update STA so that a decaying tail (where frame_energy < old STA)
-            # is properly rejected, rather than always passing because STA was just
-            # blended with the current frame_energy.
+            # Ensure current subframe is actively in an onset attack, not a decaying tail
             is_onset = frame_energy >= (pre_update_sta * 0.4)
 
             # Trigger condition
@@ -234,13 +232,10 @@ class TransientEventDetector:
                     max(-1.0, min(1.0, (right_energy - left_energy) / total_energy))
                 )
 
-                # Extract wider context window for direction estimation.
-                # Instead of the raw 512-sample subframe, extract up to 2048 samples
-                # centered on the trigger point from the extended buffer (prev + current chunk).
-                # This provides 4x better FFT frequency resolution and cross-correlation precision.
-                trigger_center_in_ext = prev_len + start_idx + sub_len // 2
+                # Extract onset-aligned context window for direction estimation
+                trigger_start_in_ext = prev_len + start_idx
                 ctx_left, ctx_right = self._extract_context_window(
-                    extended_left, extended_right, trigger_center_in_ext
+                    extended_left, extended_right, trigger_start_in_ext
                 )
 
                 # Direction estimation (ITD, ILD, multi-band dominance, confidence, self-sound)
@@ -248,7 +243,7 @@ class TransientEventDetector:
                     ctx_left, ctx_right, peak_db=peak_db, is_firing=is_firing
                 )
 
-                # Sound event classification (Footstep, Gunshot, Self-Weapon, Self-Step, Generic)
+                # Sound event classification (External Sound vs Self-Weapon / Self-Footstep)
                 sound_type, features = self.classifier.classify(
                     left_samples=ctx_left,
                     right_samples=ctx_right,
@@ -258,14 +253,20 @@ class TransientEventDetector:
                     spatial_config=self.spatial_config,
                 )
 
-                is_self = direction_est.is_self_sound or sound_type == SoundType.SELF
-                if is_self:
+                is_self_weapon = direction_est.is_self_sound
+                is_self_step = (not is_self_weapon) and (sound_type == SoundType.SELF)
+                is_self = is_self_weapon or is_self_step
+
+                if is_self_weapon:
                     self._last_self_sound_time = sub_time
 
-                # Check suppression rules (default: suppress_self_sounds is False, so self sounds trigger halo)
-                suppress_self = self.spatial_config.suppress_self_sounds and is_self
+                # Suppress self weapon if configured, or self footsteps when detected by cadence
+                suppress_event = (
+                    (self.spatial_config.suppress_self_sounds and is_self_weapon)
+                    or (self.spatial_config.suppress_self_footsteps and is_self_step)
+                )
 
-                if not suppress_self:
+                if not suppress_event:
                     self._event_counter += 1
                     event = SoundEvent(
                         event_id=f"evt_{self._event_counter}",
@@ -277,11 +278,12 @@ class TransientEventDetector:
                         direction=direction_est,
                         sound_type=sound_type,
                         features=features,
+                        left_peak_db=round(left_peak_db, 1),
+                        right_peak_db=round(right_peak_db, 1),
                     )
                     events.append(event)
 
-            # Update LTA rolling baseline
-            # Anti-poisoning: dampen LTA update during active event freeze to protect ambient baseline
+            # Update LTA rolling baseline (dampened during active burst freeze)
             if sub_time < self._lta_frozen_until:
                 effective_alpha_lta = alpha_lta * 0.05
             else:
@@ -292,9 +294,9 @@ class TransientEventDetector:
                 + effective_alpha_lta * frame_energy
             )
 
-        # Store current chunk's filtered samples for the next chunk's context buffer
-        self._prev_left = left_filtered.copy()
-        self._prev_right = right_filtered.copy()
+        # Retain up to 2048 recent filtered samples for the next chunk's pre-trigger context
+        keep_n = min(len(extended_left), self._context_target_samples)
+        self._prev_left = extended_left[-keep_n:].copy()
+        self._prev_right = extended_right[-keep_n:].copy()
 
         return events
-

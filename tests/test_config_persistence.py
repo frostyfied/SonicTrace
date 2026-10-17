@@ -65,5 +65,5 @@ def test_app_config_backward_compatibility_with_older_json(tmp_path: Path) -> No
     assert loaded.overlay_x is None
     assert loaded.overlay_y is None
     assert loaded.overlay_diameter == 320
-    assert loaded.overlay_opacity == 0.85
+    assert loaded.overlay_opacity == 0.20
     assert loaded.show_sound_numbers is True

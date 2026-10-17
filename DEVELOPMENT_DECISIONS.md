@@ -704,3 +704,29 @@ Control Panel Window [LevelMeterWindow]
    ├─► [Tab 4: TELEMETRY LOG] (Real-time Transient Event Stream)
    └─► Auto-Save Subsystem (Debounced 500ms + Exit Flush to config.json)
 ```
+
+---
+
+## Milestone 13: 360° Polar Surround Default & Real-Time In-World Mouse Head Tracking
+
+### Decision 13.1: 360° Polar Surround as New Build Default
+- **Context & Goal**:
+  - For competitive tactical shooter builds, players require full 360° situational awareness around their avatar rather than a front-hemisphere-only forward visor.
+  - New builds must launch natively with `spatial_mode: "hrtf_360"` and full 360° polar radar circle geometry (Ahead, Behind, Left, Right, 30°/45° cardinal spokes).
+- **Implementation**:
+  - `SpatialConfig.spatial_mode` defaulted to `"hrtf_360"`.
+  - Built-in `Default (Balanced)` profile configured with `spatial_mode="hrtf_360"`.
+  - `config.json` shipped with `"spatial_mode": "hrtf_360"`.
+  - `LevelMeterWindow` UI dropdown promotes `360° Polar Surround (Recommended)` as the primary display geometry.
+
+### Decision 13.2: Synchronized In-World Mouse Head-Tracking
+- **Context & Problem**:
+  - While `SpatialThreatTracker` previously tracked world-space cluster coordinates, transient visual pings (`RadarPing`), the latest sweep beam, and the on-target crosshair lock were desynchronized when turning the mouse.
+  - Players moving their mouse saw persistent rays rotate, but expanding shockwave pings and telemetry badges remained fixed at their stale relative angle.
+- **Solution**:
+  - Enabled `enable_mouse_compass = True` by default in `SpatialConfig`, `RadarOverlayWindow`, and `config.json`.
+  - Augmented `RadarPing` with `world_azimuth_deg`. In `paintEvent`, expanding transient pings dynamically project to screen space relative to `current_yaw`: `screen_az = normalize_bearing_360(ping.world_azimuth_deg - current_yaw)`.
+  - Added 60 FPS yaw-change detection (`_last_yaw`) to `_on_tick` to ensure immediate, jitter-free HUD repaint during fast mouse flicks.
+  - **Visual Crosshair Lock-On Confirmation**:
+    - When swinging the crosshair onto an active threat within lock-on tolerance (`|θ_screen| <= 6.0°`), the radar reticle chevron and `▲ 0° Ahead` marker instantly illuminate in Neon Emerald (`#34d399`, `▲ 0° LOCK`), and the bottom readout badge signals `TARGET LOCKED [0°]`.
+

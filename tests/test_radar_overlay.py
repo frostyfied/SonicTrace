@@ -219,9 +219,6 @@ def test_radar_overlay_360_threat_tracking(qapp) -> None:
 def test_radar_overlay_spatial_mode_switching(qapp) -> None:
     """Validate toggling between HRTF 360 and Stereo 180 modes on HUD."""
     hud = RadarOverlayWindow()
-    assert hud.spatial_mode == "stereo_180"
-
-    hud.set_spatial_mode("hrtf_360")
     assert hud.spatial_mode == "hrtf_360"
 
     hud.set_spatial_mode("stereo_180")
@@ -341,16 +338,75 @@ def test_radar_overlay_reset_gyro_heading(qapp) -> None:
     hud.close()
 
 
-def test_radar_overlay_direct_mode_by_default(qapp) -> None:
-    """Validate that overlay defaults to Direct Screen-Locked Mode (mouse gyro disabled)."""
+def test_radar_overlay_mouse_gyro_by_default(qapp) -> None:
+    """Validate that overlay defaults to World-Space Gyro Compass Mode."""
     hud = RadarOverlayWindow()
+    assert hud.mouse_tracker.enabled
+    assert hud.mouse_tracker.get_yaw_deg() == 0.0
+    assert hud.spatial_mode == "hrtf_360"
+
+    # Moving mouse in gyro mode accumulates yaw
+    hud.mouse_tracker.add_delta_x(500)
+    assert hud.mouse_tracker.get_yaw_deg() != 0.0
+
+    # Switching off mouse compass disables yaw accumulation (direct mode)
+    hud.set_mouse_compass_enabled(False)
     assert not hud.mouse_tracker.enabled
     assert hud.mouse_tracker.get_yaw_deg() == 0.0
-    assert hud.spatial_mode == "stereo_180"
-
-    # Moving mouse in direct mode must NEVER accumulate yaw
     hud.mouse_tracker.add_delta_x(500)
     assert hud.mouse_tracker.get_yaw_deg() == 0.0
+    hud.close()
+
+
+def test_radar_overlay_mouse_movement_shifts_markings_in_world_space(qapp) -> None:
+    """Validate that moving mouse shifts both threat cluster rays and transient pings in world space."""
+    hud = RadarOverlayWindow()
+    hud.set_mouse_compass_enabled(True)
+    hud.set_spatial_mode("hrtf_360")
+
+    # Add an event at relative bearing 45° (Front-Right)
+    d = DirectionEstimate(
+        azimuth_deg=45.0,
+        itd_ms=0.3,
+        ild_db=5.0,
+        confidence=0.85,
+        is_self_sound=False,
+        is_uncertain=False,
+        dominant_band="mid",
+        azimuth_360_deg=45.0,
+        is_rear=False,
+    )
+    e = SoundEvent(
+        event_id="test_shot",
+        timestamp=10.0,
+        peak_db=-10.0,
+        energy_ratio=5.0,
+        channel_bias=0.4,
+        duration_ms=20.0,
+        direction=d,
+    )
+    hud.add_sound_event(e)
+
+    # Initial screen bearing is 45°
+    clusters = hud.threat_tracker.get_active_clusters(current_yaw=0.0, now=10.1)
+    assert len(clusters) == 1
+    assert clusters[0].azimuth_deg == pytest.approx(45.0, abs=0.5)
+
+    # Player turns mouse to the right towards the threat (45° turn)
+    # With sensitivity 0.05, 45° = 900 counts
+    hud.mouse_tracker.add_delta_x(900)
+    assert hud.mouse_tracker.get_yaw_deg() == pytest.approx(45.0, abs=0.5)
+
+    # Threat cluster screen bearing rotates counter-clockwise to 0° (Ahead / Locked on target)
+    clusters_turned = hud.threat_tracker.get_active_clusters(current_yaw=hud.mouse_tracker.get_yaw_deg(), now=10.2)
+    assert clusters_turned[0].azimuth_deg == pytest.approx(0.0, abs=0.5)
+    assert clusters_turned[0].is_on_target is True
+
+    # Pings also have world_azimuth_deg tracked
+    assert len(hud._pings) == 1
+    assert hud._pings[0].world_azimuth_deg == pytest.approx(45.0, abs=0.5)
+
+    hud.repaint()
     hud.close()
 
 

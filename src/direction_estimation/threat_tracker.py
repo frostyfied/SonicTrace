@@ -81,13 +81,14 @@ class SpatialThreatTracker:
             now: Optional monotonic timestamp.
 
         Returns:
-            The matched or newly spawned ThreatCluster, or None if the event is a player self-sound.
+            The matched or newly spawned ThreatCluster, or None if the event is a player self-sound
+            or an isolated low-confidence/uncertain noise transient.
         """
         direction = event.direction
         if direction is None:
             return None
 
-        # Exclude player's own point-blank weapon discharges
+        # Exclude player's own point-blank weapon discharges or self-footsteps
         if direction.is_self_sound or event.sound_type == SoundType.SELF:
             return None
 
@@ -114,18 +115,24 @@ class SpatialThreatTracker:
                 best_cluster = cluster
 
         if best_cluster is not None:
-            # Merge into existing cluster:
+            # Merge into existing cluster with confidence-weighted circular EMA
             best_cluster.shot_count += 1
             best_cluster.last_seen = current_time
             best_cluster.peak_db = max(best_cluster.peak_db, event.peak_db)
-            best_cluster.confidence = max(best_cluster.confidence, direction.confidence)
             best_cluster.dominant_band = direction.dominant_band
-            best_cluster.is_rear = event_is_rear
 
-            # Circular EMA smoothing of world bearing (0.75 existing, 0.25 new)
+            # Confidence-weighted bearing smoothing: prevents low-confidence reverb tails
+            # from pulling a locked high-confidence threat ray off-target
+            conf_ratio = direction.confidence / (best_cluster.confidence + direction.confidence + 1e-6)
+            alpha_az = max(0.08, min(0.45, 0.50 * conf_ratio))
             diff = circular_angle_diff(world_azimuth, best_cluster.world_azimuth_deg)
-            smoothed_world = best_cluster.world_azimuth_deg + 0.25 * diff
+            smoothed_world = best_cluster.world_azimuth_deg + alpha_az * diff
             best_cluster.world_azimuth_deg = round(normalize_bearing_360(smoothed_world), 1)
+
+            # Only allow events with comparable confidence to flip front/rear hemisphere state
+            if direction.confidence >= best_cluster.confidence * 0.80:
+                best_cluster.is_rear = event_is_rear
+            best_cluster.confidence = max(best_cluster.confidence, direction.confidence)
 
             # Update current screen bearing
             screen_bearing = normalize_bearing_360(best_cluster.world_azimuth_deg - current_yaw)
@@ -134,6 +141,10 @@ class SpatialThreatTracker:
 
             self._rank_threats(current_time)
             return best_cluster
+
+        # Do not spawn brand-new persistent threat rays from uncertain/low-confidence echoes
+        if getattr(direction, "is_uncertain", False):
+            return None
 
         # 3. Create new persistent threat cluster
         initial_screen_bearing = normalize_bearing_360(world_azimuth - current_yaw)
@@ -167,12 +178,7 @@ class SpatialThreatTracker:
         current_yaw: float = 0.0,
         now: Optional[float] = None,
     ) -> List[ThreatCluster]:
-        """Retrieve all currently active threat clusters, updating their screen bearings to the current yaw.
-
-        Args:
-            current_yaw: Current player gyro yaw heading in degrees.
-            now: Optional monotonic timestamp.
-        """
+        """Retrieve all currently active threat clusters, updating their screen bearings to the current yaw."""
         current_time = time.monotonic() if now is None else now
         self._prune_expired(current_time)
 

@@ -20,10 +20,11 @@ class SoundClassifier:
 
     def __init__(self, sample_rate: int = 48000) -> None:
         self.sample_rate = sample_rate
+        self._last_step_candidate_time: float = -1.0
 
     def reset(self) -> None:
         """Reset internal classifier state."""
-        pass
+        self._last_step_candidate_time = -1.0
 
     def classify(
         self,
@@ -42,7 +43,7 @@ class SoundClassifier:
             direction: DirectionEstimate from DirectionEstimator.
             peak_db: Overall peak dBFS level.
             timestamp: Event timestamp in seconds.
-            spatial_config: SpatialConfig with self-sound thresholds.
+            spatial_config: SpatialConfig with self-sound and self-footstep thresholds.
 
         Returns:
             Tuple of (SoundType, AcousticFeatures).
@@ -55,5 +56,27 @@ class SoundClassifier:
         if direction.is_self_sound:
             return SoundType.SELF, features
 
-        # 2. External directional sound event (gunshot, footstep, reload, vehicle, etc.)
+        # 2. Bilateral self-footstep suppression (centered foley matching locomotion cadence)
+        if getattr(spatial_config, "suppress_self_footsteps", False):
+            in_db_window = (
+                spatial_config.self_footstep_min_db
+                <= peak_db
+                <= spatial_config.self_footstep_max_db
+            )
+            is_centered = (
+                abs(direction.ild_db) <= spatial_config.self_footstep_max_ild_db
+                and abs(direction.azimuth_deg) <= spatial_config.self_footstep_max_angle_deg
+                and abs(direction.itd_ms) <= 0.08
+            )
+            is_step_profile = (
+                features.spectral_centroid_hz < 2200.0
+                and features.attack_time_ms >= 5.0
+            )
+            if in_db_window and is_centered and is_step_profile:
+                dt = timestamp - self._last_step_candidate_time
+                self._last_step_candidate_time = timestamp
+                if 0.20 <= dt <= 0.68:
+                    return SoundType.SELF, features
+
+        # 3. External directional sound event (gunshot, footstep, reload, vehicle, etc.)
         return SoundType.SOUND, features

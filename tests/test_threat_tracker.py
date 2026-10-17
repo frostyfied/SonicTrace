@@ -194,3 +194,29 @@ def test_threat_tracker_mouse_yaw_rotation_and_target_alignment() -> None:
     assert active[0].azimuth_deg == pytest.approx(-20.0)
     assert active[0].is_on_target is False
 
+
+
+def test_threat_tracker_ignores_uncertain_new_clusters_and_weights_confidence() -> None:
+    """Uncertain noise events must not spawn new threat clusters or yank high-confidence clusters."""
+    tracker = SpatialThreatTracker(angular_tolerance_deg=20.0, cluster_lifetime_s=5.0)
+
+    # 1. Uncertain event alone does not spawn a new cluster
+    uncertain_evt = _make_event("evt_unc", azimuth_360=60.0, peak_db=-35.0, timestamp=1.0)
+    uncertain_evt.direction.is_uncertain = True
+    uncertain_evt.direction.confidence = 0.15
+    assert tracker.update(uncertain_evt, now=1.0) is None
+    assert len(tracker.get_active_clusters(now=1.0)) == 0
+
+    # 2. High-confidence event spawns cluster at +45.0°
+    strong_evt = _make_event("evt_strong", azimuth_360=45.0, peak_db=-15.0, timestamp=2.0)
+    strong_evt.direction.confidence = 0.95
+    cluster = tracker.update(strong_evt, now=2.0)
+    assert cluster is not None
+    assert cluster.azimuth_deg == pytest.approx(45.0)
+
+    # 3. Low-confidence reflection at +60.0° nudges cluster minimally (< 2.5°) instead of 25% (+3.8°)
+    weak_echo = _make_event("evt_echo", azimuth_360=60.0, peak_db=-28.0, timestamp=2.1)
+    weak_echo.direction.confidence = 0.10
+    updated = tracker.update(weak_echo, now=2.1)
+    assert updated is not None
+    assert updated.azimuth_deg < 47.0

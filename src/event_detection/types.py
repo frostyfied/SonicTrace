@@ -22,3 +22,5 @@ class SoundEvent:
     direction: Optional[DirectionEstimate] = None
     sound_type: SoundType = SoundType.GENERIC
     features: Optional[AcousticFeatures] = None
+    left_peak_db: Optional[float] = None
+    right_peak_db: Optional[float] = None

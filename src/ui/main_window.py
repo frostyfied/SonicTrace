@@ -9,6 +9,7 @@ from typing import Optional, Tuple
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QCloseEvent, QFont
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -243,6 +244,13 @@ class LevelMeterWindow(QMainWindow):
 
         if self.config.overlay_x is not None and self.config.overlay_y is not None:
             self.radar_overlay.move(self.config.overlay_x, self.config.overlay_y)
+        else:
+            screen = QApplication.primaryScreen()
+            if screen:
+                geom = screen.geometry()
+                cx = (geom.width() - self.radar_overlay.width()) // 2
+                cy = (geom.height() - self.radar_overlay.height()) // 2
+                self.radar_overlay.move(max(0, cx), max(0, cy))
 
         self.radar_overlay.position_changed.connect(self._on_overlay_position_changed)
 
@@ -503,17 +511,18 @@ class LevelMeterWindow(QMainWindow):
         grid_disp.addWidget(lbl_mode, 0, 0)
 
         self.hud_mode_combo = QComboBox()
-        self.hud_mode_combo.addItem("180° Stereo Forward Arc (Recommended)", "stereo_180")
-        self.hud_mode_combo.addItem("360° Polar Surround", "hrtf_360")
-        if self.config.spatial.spatial_mode == "stereo_180":
-            self.hud_mode_combo.setCurrentIndex(0)
+        self.hud_mode_combo.addItem("360° Polar Surround (Recommended)", "hrtf_360")
+        self.hud_mode_combo.addItem("180° Stereo Forward Arc", "stereo_180")
+        idx = self.hud_mode_combo.findData(self.config.spatial.spatial_mode)
+        if idx >= 0:
+            self.hud_mode_combo.setCurrentIndex(idx)
         else:
-            self.hud_mode_combo.setCurrentIndex(1)
+            self.hud_mode_combo.setCurrentIndex(0)
         self.hud_mode_combo.setToolTip(
             "Radar Coordinate Geometry\n"
-            "- 180° Stereo Forward Arc (Recommended): Maps sounds cleanly across your forward vision (0° Ahead = Crosshair).\n"
-            "  Zero front-to-back ambiguity or false rear flipping. Ideal for competitive FPS gaming.\n"
-            "- 360° Polar Surround: Full 360° polar radar circle with front and rear hemispheres for 3D audio."
+            "- 360° Polar Surround (Recommended): Full 360° circular polar radar with persistent world-space gyro compass tracking.\n"
+            "  Threat rays dynamically shift as you move your mouse to guide crosshair target alignment.\n"
+            "- 180° Stereo Forward Arc: Maps sounds cleanly across your forward vision (0° Ahead = Crosshair) with shaded rear dome."
         )
         self.hud_mode_combo.currentIndexChanged.connect(self._on_hud_mode_changed)
         grid_disp.addWidget(self.hud_mode_combo, 0, 1)
@@ -656,9 +665,9 @@ class LevelMeterWindow(QMainWindow):
         self.mouse_compass_cb.setChecked(self.config.spatial.enable_mouse_compass)
         self.mouse_compass_cb.setToolTip(
             "Aim Orientation Engine\n"
-            "- Unchecked (Recommended Direct Mode): Radar is locked directly to your screen crosshair with zero drift.\n"
-            "  The top of the radar (0°) always represents where you are aiming.\n"
-            "- Checked (Mouse Gyro): Rotates threat blips using raw mouse input to keep them fixed in world space."
+            "- Checked (Recommended Gyro): Rotates threat blips using raw mouse input to keep them fixed in world space.\n"
+            "  Turning your crosshair toward the sound brings the threat ray to 0° Ahead.\n"
+            "- Unchecked (Direct Screen-Locked): Radar is locked directly to your screen crosshair with zero mouse tracking."
         )
         self.mouse_compass_cb.toggled.connect(self._on_mouse_compass_toggled)
         mode_btn_box.addWidget(self.mouse_compass_cb)
@@ -1395,7 +1404,9 @@ class LevelMeterWindow(QMainWindow):
         self.radar_overlay.add_sound_event(event)
 
         if self.calibrator.state == CalibrationState.RECORDING:
-            cal_res = self.calibrator.register_shot(event.peak_db, event.peak_db)
+            l_db = event.left_peak_db if event.left_peak_db is not None else event.peak_db
+            r_db = event.right_peak_db if event.right_peak_db is not None else event.peak_db
+            cal_res = self.calibrator.register_shot(l_db, r_db)
             if cal_res is not None:
                 self._apply_calibration_result(cal_res)
 

@@ -320,3 +320,72 @@ def test_pubg_near_center_gunshot_preserves_front_bearing() -> None:
 
 
 
+
+
+def test_high_frequency_transient_itd_no_cycle_skipping() -> None:
+    """High-frequency decaying transient (5.5 kHz bullet crack) must recover true ITD without carrier cycle skipping."""
+    fs = 48000
+    t = np.arange(2048) / float(fs)
+    crack = (np.exp(-t * 120.0) * np.sin(2.0 * np.pi * 5500.0 * t)).astype(np.float32)
+    # Delay Left channel by +19 samples (+0.396 ms -> Right hemisphere)
+    right = crack * 0.70
+    left = np.pad(crack * 0.60, (19, 0))[:2048]
+
+    estimator = DirectionEstimator(sample_rate=fs)
+    est = estimator.estimate(left, right, peak_db=-10.0)
+
+    assert est.itd_ms == pytest.approx(0.396, abs=0.03)
+    assert est.azimuth_deg > 10.0
+
+
+def test_low_dominant_transient_preserves_high_band_ild() -> None:
+    """A bass-heavy footstep thud (250 Hz) + high-frequency scuff (3500 Hz) must preserve the high-band ILD cue."""
+    fs = 48000
+    t = np.arange(2048) / float(fs)
+    thud_low = (0.70 * np.sin(2.0 * np.pi * 250.0 * t)).astype(np.float32)
+    scuff_r = (0.25 * np.sin(2.0 * np.pi * 3500.0 * t)).astype(np.float32)
+    scuff_l = scuff_r * 0.25  # +12 dB ILD in the 3.5 kHz head-shadow band
+
+    estimator = DirectionEstimator(sample_rate=fs)
+    est = estimator.estimate(thud_low + scuff_l, thud_low + scuff_r, peak_db=-20.0)
+
+    assert est.dominant_band == "low"
+    assert est.ild_db > 8.0
+    assert est.azimuth_deg > 30.0
+
+
+def test_corridor_reflection_haas_precedence_window() -> None:
+    """Direct sound followed 8ms later by an opposite-wall reflection must prioritize the direct arrival."""
+    fs = 48000
+    burst_len = 240
+    tb = np.arange(burst_len) / float(fs)
+    wave = (np.hanning(burst_len) * np.sin(2.0 * np.pi * 1600.0 * tb)).astype(np.float32)
+
+    sig_l = np.zeros(2048, dtype=np.float32)
+    sig_r = np.zeros(2048, dtype=np.float32)
+    # Direct wave from Right at sample 600
+    sig_r[600 : 600 + burst_len] += wave * 0.75
+    sig_l[610 : 610 + burst_len] += wave * 0.45
+    # Opposite-wall reflection from Left at sample 980 (~7.9 ms later)
+    sig_l[980 : 980 + burst_len] += wave * 0.72
+    sig_r[992 : 992 + burst_len] += wave * 0.42
+
+    estimator = DirectionEstimator(sample_rate=fs)
+    est = estimator.estimate(sig_l, sig_r, peak_db=-10.0)
+
+    # Must stay in the Right (+azimuth) hemisphere of the direct arrival
+    assert est.azimuth_deg > 5.0
+
+
+def test_distant_front_gunshot_not_flipped_to_rear_in_hrtf_360() -> None:
+    """Distant muffled front gunshots (LPF < 4 kHz, peak_db < -20 dBFS) must not flip to rear in hrtf_360 mode."""
+    fs = 48000
+    t = np.arange(2048) / float(fs)
+    dist_shot = (0.6 * np.sin(2.0 * np.pi * 1800.0 * t) + 0.3 * np.sin(2.0 * np.pi * 3200.0 * t)).astype(np.float32)
+
+    cfg = SpatialConfig(spatial_mode="hrtf_360", enable_front_back=True)
+    estimator = DirectionEstimator(config=cfg, sample_rate=fs)
+    est = estimator.estimate(dist_shot * 0.50, dist_shot * 0.75, peak_db=-28.0)
+
+    assert not est.is_rear
+    assert 0.0 < est.azimuth_360_deg < 45.0
